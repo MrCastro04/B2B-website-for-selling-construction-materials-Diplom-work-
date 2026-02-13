@@ -105,47 +105,81 @@ app.get('/api/products/:id', async (req, res) => {
 // ============================================
 // POST /api/orders — створити нове замовлення
 // ============================================
-// Очікуваний формат тіла запиту (JSON):
-// {
-//   "customer_name": "Іван Петренко",
-//   "items": [
-//     { "id": 1, "price": 350.50, "quantity": 2 },
-//     { "id": 3, "price": 450.00, "quantity": 1 }
-//   ]
-// }
+// Використовуємо MySQL-транзакцію, щоб гарантувати:
+// 1. Перевірку наявності товару на складі
+// 2. Створення замовлення + позицій
+// 3. Списання товару зі складу
+// Якщо будь-який крок не вдається — відкат (ROLLBACK)
 app.post('/api/orders', async (req, res) => {
-  // Отримуємо дані з тіла запиту
   const { customer_name, items } = req.body;
 
   // ---- Валідація вхідних даних ----
-  // Перевіряємо, що ім'я покупця передано
   if (!customer_name || !customer_name.trim()) {
     return res.status(400).json({ error: "Вкажіть ім'я покупця" });
   }
 
-  // Перевіряємо, що масив товарів не порожній
   if (!items || items.length === 0) {
     return res.status(400).json({ error: 'Кошик порожній' });
   }
 
+  // Отримуємо окреме з'єднання з пулу для транзакції
+  const connection = await pool.promise().getConnection();
+
   try {
-    // ---- Обчислюємо загальну суму замовлення ----
+    // ---- Починаємо транзакцію ----
+    await connection.beginTransaction();
+
+    // ---- Крок 1: Перевіряємо наявність товару на складі ----
+    // Збираємо ID усіх товарів із кошика
+    const productIds = items.map((item) => item.id);
+
+    // Отримуємо актуальні залишки з бази (SELECT ... FOR UPDATE блокує рядки)
+    const [stockRows] = await connection.query(
+      'SELECT id, name, stock_quantity FROM products WHERE id IN (?) FOR UPDATE',
+      [productIds]
+    );
+
+    // Створюємо Map для швидкого доступу: id → { name, stock_quantity }
+    const stockMap = new Map();
+    stockRows.forEach((row) => stockMap.set(row.id, row));
+
+    // Перевіряємо кожен товар із кошика
+    for (const item of items) {
+      const product = stockMap.get(item.id);
+
+      // Товар не знайдено в базі
+      if (!product) {
+        await connection.rollback();
+        connection.release();
+        return res.status(400).json({
+          error: `Товар з ID ${item.id} не знайдено`,
+        });
+      }
+
+      // Недостатньо товару на складі
+      if (product.stock_quantity < item.quantity) {
+        await connection.rollback();
+        connection.release();
+        return res.status(400).json({
+          error: `Недостатньо товару на складі: "${product.name}" (доступно: ${product.stock_quantity}, замовлено: ${item.quantity})`,
+        });
+      }
+    }
+
+    // ---- Крок 2: Обчислюємо загальну суму ----
     const totalPrice = items.reduce(
       (sum, item) => sum + Number(item.price) * item.quantity,
       0
     );
 
-    // ---- Крок 1: Вставляємо запис у таблицю orders ----
-    const [orderResult] = await db.query(
+    // ---- Крок 3: Створюємо запис замовлення ----
+    const [orderResult] = await connection.query(
       'INSERT INTO orders (total_price, customer_name, status) VALUES (?, ?, ?)',
       [totalPrice, customer_name.trim(), 'new']
     );
-
-    // Отримуємо ID щойно створеного замовлення
     const orderId = orderResult.insertId;
 
-    // ---- Крок 2: Вставляємо позиції замовлення в order_items ----
-    // Формуємо масив значень для batch-вставки
+    // ---- Крок 4: Вставляємо позиції замовлення ----
     const orderItemsValues = items.map((item) => [
       orderId,
       item.id,
@@ -153,13 +187,24 @@ app.post('/api/orders', async (req, res) => {
       Number(item.price),
     ]);
 
-    await db.query(
+    await connection.query(
       'INSERT INTO order_items (order_id, product_id, quantity, price) VALUES ?',
       [orderItemsValues]
     );
 
-    // ---- Відповідь клієнту з номером замовлення ----
-    console.log(`✅ Нове замовлення #${orderId} від "${customer_name}" на суму ${totalPrice.toFixed(2)} ₴`);
+    // ---- Крок 5: Списуємо товар зі складу ----
+    for (const item of items) {
+      await connection.query(
+        'UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?',
+        [item.quantity, item.id]
+      );
+    }
+
+    // ---- Фіксуємо транзакцію — все пройшло успішно ----
+    await connection.commit();
+    connection.release();
+
+    console.log(`✅ Замовлення #${orderId} від "${customer_name}" на ${totalPrice.toFixed(2)} ₴ (склад оновлено)`);
 
     res.status(201).json({
       message: 'Замовлення успішно створено!',
@@ -167,8 +212,36 @@ app.post('/api/orders', async (req, res) => {
       totalPrice: totalPrice,
     });
   } catch (err) {
+    // Якщо сталася помилка — відкочуємо транзакцію
+    await connection.rollback();
+    connection.release();
     console.error('Помилка при створенні замовлення:', err.message);
     res.status(500).json({ error: 'Помилка сервера при створенні замовлення' });
+  }
+});
+
+// ============================================
+// GET /api/admin/orders — список усіх замовлень
+// ============================================
+// Повертає: ID, ім'я клієнта, дату, суму, статус
+// Сортування: найновіші зверху
+app.get('/api/admin/orders', async (req, res) => {
+  try {
+    const [orders] = await db.query(
+      `SELECT
+        id,
+        customer_name,
+        total_price,
+        status,
+        DATE_FORMAT(created_at, '%d.%m.%Y %H:%i') AS created_at_formatted,
+        created_at
+      FROM orders
+      ORDER BY created_at DESC`
+    );
+    res.json(orders);
+  } catch (err) {
+    console.error('Помилка при отриманні замовлень:', err.message);
+    res.status(500).json({ error: 'Помилка сервера при отриманні замовлень' });
   }
 });
 
@@ -185,4 +258,5 @@ app.listen(PORT, async () => {
   console.log(`  GET  http://localhost:${PORT}/api/categories`);
   console.log(`  GET  http://localhost:${PORT}/api/products/:id`);
   console.log(`  POST http://localhost:${PORT}/api/orders`);
+  console.log(`  GET  http://localhost:${PORT}/api/admin/orders`);
 });

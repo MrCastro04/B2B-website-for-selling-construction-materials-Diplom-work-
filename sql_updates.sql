@@ -65,6 +65,38 @@ CREATE TABLE IF NOT EXISTS order_items (
 );
 
 -- ============================================
+-- 5. Корисні SQL-запити для адміністратора
+-- ============================================
+
+-- Вибірка всіх замовлень: ID, клієнт, дата, сума, статус
+SELECT
+  id AS 'ID замовлення',
+  customer_name AS 'Клієнт',
+  DATE_FORMAT(created_at, '%d.%m.%Y %H:%i') AS 'Дата',
+  total_price AS 'Сума (₴)',
+  status AS 'Статус'
+FROM orders
+ORDER BY created_at DESC;
+
+-- Детальна вибірка: замовлення з переліком товарів
+SELECT
+  o.id AS 'ID замовлення',
+  o.customer_name AS 'Клієнт',
+  DATE_FORMAT(o.created_at, '%d.%m.%Y %H:%i') AS 'Дата',
+  p.name AS 'Товар',
+  oi.quantity AS 'Кількість',
+  oi.price AS 'Ціна за шт.',
+  (oi.quantity * oi.price) AS 'Сума позиції',
+  o.total_price AS 'Загальна сума'
+FROM orders o
+JOIN order_items oi ON oi.order_id = o.id
+JOIN products p ON p.id = oi.product_id
+ORDER BY o.created_at DESC, p.name;
+
+-- Перевірка залишків на складі
+SELECT id, name, stock_quantity AS 'На складі' FROM products;
+
+-- ============================================
 -- Перевірка: подивись, що все створено правильно
 -- ============================================
 SELECT * FROM products;
