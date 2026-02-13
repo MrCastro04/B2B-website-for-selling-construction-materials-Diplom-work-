@@ -103,6 +103,76 @@ app.get('/api/products/:id', async (req, res) => {
 });
 
 // ============================================
+// POST /api/orders — створити нове замовлення
+// ============================================
+// Очікуваний формат тіла запиту (JSON):
+// {
+//   "customer_name": "Іван Петренко",
+//   "items": [
+//     { "id": 1, "price": 350.50, "quantity": 2 },
+//     { "id": 3, "price": 450.00, "quantity": 1 }
+//   ]
+// }
+app.post('/api/orders', async (req, res) => {
+  // Отримуємо дані з тіла запиту
+  const { customer_name, items } = req.body;
+
+  // ---- Валідація вхідних даних ----
+  // Перевіряємо, що ім'я покупця передано
+  if (!customer_name || !customer_name.trim()) {
+    return res.status(400).json({ error: "Вкажіть ім'я покупця" });
+  }
+
+  // Перевіряємо, що масив товарів не порожній
+  if (!items || items.length === 0) {
+    return res.status(400).json({ error: 'Кошик порожній' });
+  }
+
+  try {
+    // ---- Обчислюємо загальну суму замовлення ----
+    const totalPrice = items.reduce(
+      (sum, item) => sum + Number(item.price) * item.quantity,
+      0
+    );
+
+    // ---- Крок 1: Вставляємо запис у таблицю orders ----
+    const [orderResult] = await db.query(
+      'INSERT INTO orders (total_price, customer_name, status) VALUES (?, ?, ?)',
+      [totalPrice, customer_name.trim(), 'new']
+    );
+
+    // Отримуємо ID щойно створеного замовлення
+    const orderId = orderResult.insertId;
+
+    // ---- Крок 2: Вставляємо позиції замовлення в order_items ----
+    // Формуємо масив значень для batch-вставки
+    const orderItemsValues = items.map((item) => [
+      orderId,
+      item.id,
+      item.quantity,
+      Number(item.price),
+    ]);
+
+    await db.query(
+      'INSERT INTO order_items (order_id, product_id, quantity, price) VALUES ?',
+      [orderItemsValues]
+    );
+
+    // ---- Відповідь клієнту з номером замовлення ----
+    console.log(`✅ Нове замовлення #${orderId} від "${customer_name}" на суму ${totalPrice.toFixed(2)} ₴`);
+
+    res.status(201).json({
+      message: 'Замовлення успішно створено!',
+      orderId: orderId,
+      totalPrice: totalPrice,
+    });
+  } catch (err) {
+    console.error('Помилка при створенні замовлення:', err.message);
+    res.status(500).json({ error: 'Помилка сервера при створенні замовлення' });
+  }
+});
+
+// ============================================
 // 6. Запуск сервера
 // ============================================
 app.listen(PORT, async () => {
@@ -110,8 +180,9 @@ app.listen(PORT, async () => {
   await testConnection();
   console.log('');
   console.log('Доступні маршрути:');
-  console.log(`  GET http://localhost:${PORT}/`);
-  console.log(`  GET http://localhost:${PORT}/api/products`);
-  console.log(`  GET http://localhost:${PORT}/api/categories`);
-  console.log(`  GET http://localhost:${PORT}/api/products/:id`);
+  console.log(`  GET  http://localhost:${PORT}/`);
+  console.log(`  GET  http://localhost:${PORT}/api/products`);
+  console.log(`  GET  http://localhost:${PORT}/api/categories`);
+  console.log(`  GET  http://localhost:${PORT}/api/products/:id`);
+  console.log(`  POST http://localhost:${PORT}/api/orders`);
 });
