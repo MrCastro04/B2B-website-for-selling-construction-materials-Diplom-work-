@@ -4,6 +4,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const mysql = require('mysql2');
+const bcrypt = require('bcryptjs');
 
 // ============================================
 // 1. Створюємо Express-додаток
@@ -103,6 +104,115 @@ app.get('/api/products/:id', async (req, res) => {
 });
 
 // ============================================
+// POST /api/register — реєстрація нового користувача
+// ============================================
+app.post('/api/register', async (req, res) => {
+  const { name, email, password } = req.body;
+
+  // ---- Валідація ----
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: "Вкажіть ваше ім'я" });
+  }
+
+  if (!email || !email.trim()) {
+    return res.status(400).json({ error: 'Вкажіть email' });
+  }
+
+  // Перевіряємо, що email закінчується на @gmail.com
+  if (!email.trim().toLowerCase().endsWith('@gmail.com')) {
+    return res.status(400).json({ error: 'Дозволені тільки адреси @gmail.com' });
+  }
+
+  if (!password || password.length < 6) {
+    return res.status(400).json({ error: 'Пароль має містити щонайменше 6 символів' });
+  }
+
+  try {
+    // Перевіряємо, чи email вже зайнятий
+    const [existing] = await db.query(
+      'SELECT id FROM users WHERE email = ?',
+      [email.trim().toLowerCase()]
+    );
+
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Користувач з таким email вже існує' });
+    }
+
+    // Хешуємо пароль (10 раундів bcrypt)
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // Зберігаємо користувача в базу
+    const [result] = await db.query(
+      'INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)',
+      [name.trim(), email.trim().toLowerCase(), passwordHash]
+    );
+
+    console.log(`✅ Новий користувач: "${name}" (${email})`);
+
+    res.status(201).json({
+      user: {
+        id: result.insertId,
+        name: name.trim(),
+        email: email.trim().toLowerCase(),
+      },
+    });
+  } catch (err) {
+    console.error('Помилка при реєстрації:', err.message);
+    res.status(500).json({ error: 'Помилка сервера при реєстрації' });
+  }
+});
+
+// ============================================
+// POST /api/login — вхід користувача
+// ============================================
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  // ---- Валідація ----
+  if (!email || !email.trim()) {
+    return res.status(400).json({ error: 'Вкажіть email' });
+  }
+
+  if (!password) {
+    return res.status(400).json({ error: 'Вкажіть пароль' });
+  }
+
+  try {
+    // Шукаємо користувача за email
+    const [users] = await db.query(
+      'SELECT id, name, email, password_hash FROM users WHERE email = ?',
+      [email.trim().toLowerCase()]
+    );
+
+    if (users.length === 0) {
+      return res.status(401).json({ error: 'Невірний email або пароль' });
+    }
+
+    const user = users[0];
+
+    // Порівнюємо пароль з хешем
+    const isMatch = await bcrypt.compare(password, user.password_hash);
+
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Невірний email або пароль' });
+    }
+
+    console.log(`✅ Вхід: "${user.name}" (${user.email})`);
+
+    res.json({
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+      },
+    });
+  } catch (err) {
+    console.error('Помилка при вході:', err.message);
+    res.status(500).json({ error: 'Помилка сервера при вході' });
+  }
+});
+
+// ============================================
 // POST /api/orders — створити нове замовлення
 // ============================================
 // Використовуємо MySQL-транзакцію, щоб гарантувати:
@@ -111,7 +221,7 @@ app.get('/api/products/:id', async (req, res) => {
 // 3. Списання товару зі складу
 // Якщо будь-який крок не вдається — відкат (ROLLBACK)
 app.post('/api/orders', async (req, res) => {
-  const { customer_name, items } = req.body;
+  const { customer_name, items, user_id } = req.body;
 
   // ---- Валідація вхідних даних ----
   if (!customer_name || !customer_name.trim()) {
@@ -173,9 +283,10 @@ app.post('/api/orders', async (req, res) => {
     );
 
     // ---- Крок 3: Створюємо запис замовлення ----
+    // Якщо user_id передано — прив'язуємо замовлення до користувача
     const [orderResult] = await connection.query(
-      'INSERT INTO orders (total_price, customer_name, status) VALUES (?, ?, ?)',
-      [totalPrice, customer_name.trim(), 'new']
+      'INSERT INTO orders (total_price, customer_name, status, user_id) VALUES (?, ?, ?, ?)',
+      [totalPrice, customer_name.trim(), 'new', user_id || null]
     );
     const orderId = orderResult.insertId;
 
@@ -221,6 +332,63 @@ app.post('/api/orders', async (req, res) => {
 });
 
 // ============================================
+// GET /api/orders/:name — історія замовлень за іменем покупця
+// ============================================
+// Повертає замовлення конкретного клієнта з переліком товарів
+app.get('/api/orders/:name', async (req, res) => {
+  const customerName = decodeURIComponent(req.params.name).trim();
+
+  if (!customerName) {
+    return res.status(400).json({ error: "Вкажіть ім'я покупця" });
+  }
+
+  try {
+    // Крок 1: Знаходимо всі замовлення цього клієнта
+    const [orders] = await db.query(
+      `SELECT
+        id,
+        total_price,
+        status,
+        DATE_FORMAT(created_at, '%d.%m.%Y %H:%i') AS created_at_formatted
+      FROM orders
+      WHERE customer_name = ?
+      ORDER BY created_at DESC`,
+      [customerName]
+    );
+
+    // Якщо замовлень немає — повертаємо порожній масив
+    if (orders.length === 0) {
+      return res.json([]);
+    }
+
+    // Крок 2: Для кожного замовлення завантажуємо позиції (товари)
+    const orderIds = orders.map((o) => o.id);
+    const [items] = await db.query(
+      `SELECT
+        oi.order_id,
+        p.name AS product_name,
+        oi.quantity,
+        oi.price
+      FROM order_items oi
+      JOIN products p ON p.id = oi.product_id
+      WHERE oi.order_id IN (?)`,
+      [orderIds]
+    );
+
+    // Крок 3: Групуємо позиції по замовленнях
+    const result = orders.map((order) => ({
+      ...order,
+      items: items.filter((item) => item.order_id === order.id),
+    }));
+
+    res.json(result);
+  } catch (err) {
+    console.error('Помилка при отриманні історії замовлень:', err.message);
+    res.status(500).json({ error: 'Помилка сервера при отриманні історії' });
+  }
+});
+
+// ============================================
 // GET /api/admin/orders — список усіх замовлень
 // ============================================
 // Повертає: ID, ім'я клієнта, дату, суму, статус
@@ -254,9 +422,12 @@ app.listen(PORT, async () => {
   console.log('');
   console.log('Доступні маршрути:');
   console.log(`  GET  http://localhost:${PORT}/`);
+  console.log(`  POST http://localhost:${PORT}/api/register`);
+  console.log(`  POST http://localhost:${PORT}/api/login`);
   console.log(`  GET  http://localhost:${PORT}/api/products`);
   console.log(`  GET  http://localhost:${PORT}/api/categories`);
   console.log(`  GET  http://localhost:${PORT}/api/products/:id`);
   console.log(`  POST http://localhost:${PORT}/api/orders`);
+  console.log(`  GET  http://localhost:${PORT}/api/orders/:name`);
   console.log(`  GET  http://localhost:${PORT}/api/admin/orders`);
 });
