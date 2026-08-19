@@ -108,6 +108,30 @@ app.get('/api/products/:id', async (req, res) => {
 });
 
 // ============================================
+// GET /api/delivery-methods
+// ============================================
+app.get('/api/delivery-methods', async (req, res) => {
+  try {
+    const [methods] = await db.query('SELECT * FROM delivery_methods ORDER BY id');
+    res.json(methods);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// GET /api/suppliers
+// ============================================
+app.get('/api/suppliers', async (req, res) => {
+  try {
+    const [suppliers] = await db.query('SELECT * FROM suppliers ORDER BY id');
+    res.json(suppliers);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // POST /api/register — реєстрація нового користувача
 // ============================================
 app.post('/api/register', async (req, res) => {
@@ -224,8 +248,9 @@ app.post('/api/login', async (req, res) => {
 // 2. Створення замовлення + позицій
 // 3. Списання товару зі складу
 // Якщо будь-який крок не вдається — відкат (ROLLBACK)
+
 app.post('/api/orders', async (req, res) => {
-  const { customer_name, items, user_id } = req.body;
+  const { customer_name, items, user_id, delivery_method_id } = req.body;
 
   // ---- Валідація вхідних даних ----
   if (!customer_name || !customer_name.trim()) {
@@ -289,8 +314,8 @@ app.post('/api/orders', async (req, res) => {
     // ---- Крок 3: Створюємо запис замовлення ----
     // Якщо user_id передано — прив'язуємо замовлення до користувача
     const [orderResult] = await connection.query(
-      'INSERT INTO orders (total_price, customer_name, status, user_id) VALUES (?, ?, ?, ?)',
-      [totalPrice, customer_name.trim(), 'new', user_id || null]
+      'INSERT INTO orders (total_price, customer_name, status, user_id, delivery_method_id) VALUES (?, ?, ?, ?, ?)',
+      [totalPrice, customer_name.trim(), 'new', user_id || null, delivery_method_id || null]
     );
     const orderId = orderResult.insertId;
 
@@ -318,6 +343,13 @@ app.post('/api/orders', async (req, res) => {
     // ---- Фіксуємо транзакцію — все пройшло успішно ----
     await connection.commit();
     connection.release();
+
+    // ---- Крок 6: Створюємо receipt (чек) ----
+    const totalCount = items.reduce((sum, i) => sum + i.quantity, 0);
+    await db.query(
+      'INSERT INTO receipts (order_id, order_count, order_price) VALUES (?, ?, ?)',
+      [orderId, totalCount, totalPrice]
+    );
 
     console.log(`✅ Замовлення #${orderId} від "${customer_name}" на ${totalPrice.toFixed(2)} ₴ (склад оновлено)`);
 
@@ -421,21 +453,27 @@ app.get('/api/admin/orders', async (req, res) => {
 // 5а. Seed адмін-користувача при старті
 // ============================================
 async function seedAdmin() {
+  const adminEmail = process.env.ADMIN_EMAIL;
+  const adminPassword = process.env.ADMIN_PASSWORD;
+
+  if (!adminEmail || !adminPassword) {
+    console.log('ℹ️ ADMIN_EMAIL/ADMIN_PASSWORD не задані в .env — сидинг адміна пропущено');
+    return;
+  }
+
   try {
-    const adminEmail = 'admin@gmail.com';
-    const adminPassword = 'admin123';
     const adminName = 'Адміністратор';
     const hash = await bcrypt.hash(adminPassword, 10);
     const [existing] = await db.query('SELECT id FROM users WHERE email = ?', [adminEmail]);
     if (existing.length > 0) {
       await db.query('UPDATE users SET password_hash = ? WHERE email = ?', [hash, adminEmail]);
-      console.log('✅ Пароль адміна оновлено (admin@gmail.com / admin123)');
+      console.log(`✅ Пароль адміна оновлено (${adminEmail})`);
     } else {
       await db.query(
         'INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)',
         [adminName, adminEmail, hash]
       );
-      console.log('✅ Адміна створено (admin@gmail.com / admin123)');
+      console.log(`✅ Адміна створено (${adminEmail})`);
     }
   } catch (err) {
     console.error('⚠️ Помилка seedAdmin:', err.message);
