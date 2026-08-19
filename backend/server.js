@@ -17,7 +17,11 @@ const PORT = process.env.PORT || 5000;
 // ============================================
 
 // cors — дозволяє запити з frontend (інший порт)
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
 // Парсинг JSON у тілі запитів
 app.use(express.json());
@@ -100,6 +104,30 @@ app.get('/api/products/:id', async (req, res) => {
   } catch (err) {
     console.error('Помилка при отриманні товару:', err.message);
     res.status(500).json({ error: 'Помилка сервера при отриманні товару' });
+  }
+});
+
+// ============================================
+// GET /api/delivery-methods
+// ============================================
+app.get('/api/delivery-methods', async (req, res) => {
+  try {
+    const [methods] = await db.query('SELECT * FROM delivery_methods ORDER BY id');
+    res.json(methods);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// GET /api/suppliers
+// ============================================
+app.get('/api/suppliers', async (req, res) => {
+  try {
+    const [suppliers] = await db.query('SELECT * FROM suppliers ORDER BY id');
+    res.json(suppliers);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -220,8 +248,9 @@ app.post('/api/login', async (req, res) => {
 // 2. Створення замовлення + позицій
 // 3. Списання товару зі складу
 // Якщо будь-який крок не вдається — відкат (ROLLBACK)
+
 app.post('/api/orders', async (req, res) => {
-  const { customer_name, items, user_id } = req.body;
+  const { customer_name, items, user_id, delivery_method_id } = req.body;
 
   // ---- Валідація вхідних даних ----
   if (!customer_name || !customer_name.trim()) {
@@ -285,8 +314,8 @@ app.post('/api/orders', async (req, res) => {
     // ---- Крок 3: Створюємо запис замовлення ----
     // Якщо user_id передано — прив'язуємо замовлення до користувача
     const [orderResult] = await connection.query(
-      'INSERT INTO orders (total_price, customer_name, status, user_id) VALUES (?, ?, ?, ?)',
-      [totalPrice, customer_name.trim(), 'new', user_id || null]
+      'INSERT INTO orders (total_price, customer_name, status, user_id, delivery_method_id) VALUES (?, ?, ?, ?, ?)',
+      [totalPrice, customer_name.trim(), 'new', user_id || null, delivery_method_id || null]
     );
     const orderId = orderResult.insertId;
 
@@ -314,6 +343,13 @@ app.post('/api/orders', async (req, res) => {
     // ---- Фіксуємо транзакцію — все пройшло успішно ----
     await connection.commit();
     connection.release();
+
+    // ---- Крок 6: Створюємо receipt (чек) ----
+    const totalCount = items.reduce((sum, i) => sum + i.quantity, 0);
+    await db.query(
+      'INSERT INTO receipts (order_id, order_count, order_price) VALUES (?, ?, ?)',
+      [orderId, totalCount, totalPrice]
+    );
 
     console.log(`✅ Замовлення #${orderId} від "${customer_name}" на ${totalPrice.toFixed(2)} ₴ (склад оновлено)`);
 
@@ -414,11 +450,106 @@ app.get('/api/admin/orders', async (req, res) => {
 });
 
 // ============================================
+// 5а. Seed адмін-користувача при старті
+// ============================================
+async function seedAdmin() {
+  const adminEmail = process.env.ADMIN_EMAIL;
+  const adminPassword = process.env.ADMIN_PASSWORD;
+
+  if (!adminEmail || !adminPassword) {
+    console.log('ℹ️ ADMIN_EMAIL/ADMIN_PASSWORD не задані в .env — сидинг адміна пропущено');
+    return;
+  }
+
+  try {
+    const adminName = 'Адміністратор';
+    const hash = await bcrypt.hash(adminPassword, 10);
+    const [existing] = await db.query('SELECT id FROM users WHERE email = ?', [adminEmail]);
+    if (existing.length > 0) {
+      await db.query('UPDATE users SET password_hash = ? WHERE email = ?', [hash, adminEmail]);
+      console.log(`✅ Пароль адміна оновлено (${adminEmail})`);
+    } else {
+      await db.query(
+        'INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)',
+        [adminName, adminEmail, hash]
+      );
+      console.log(`✅ Адміна створено (${adminEmail})`);
+    }
+  } catch (err) {
+    console.error('⚠️ Помилка seedAdmin:', err.message);
+  }
+}
+
+// ============================================
+// POST /api/admin/products — створити товар
+// ============================================
+app.post('/api/admin/products', async (req, res) => {
+  const { name, description, price, stock_quantity, category_id, image_url } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Вкажіть назву товару' });
+  if (!price || isNaN(price)) return res.status(400).json({ error: 'Вкажіть коректну ціну' });
+  if (!category_id) return res.status(400).json({ error: 'Вкажіть категорію' });
+  try {
+    const [result] = await db.query(
+      'INSERT INTO products (name, description, price, stock_quantity, category_id, image_url) VALUES (?, ?, ?, ?, ?, ?)',
+      [name.trim(), description || '', Number(price), Number(stock_quantity) || 0, Number(category_id), image_url || null]
+    );
+    const [rows] = await db.query('SELECT * FROM products WHERE id = ?', [result.insertId]);
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('POST /api/admin/products error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// PUT /api/admin/products/:id — оновити товар
+// ============================================
+app.put('/api/admin/products/:id', async (req, res) => {
+  try {
+    const { name, description, price, stock_quantity, category_id, image_url } = req.body;
+    const id = Number(req.params.id);
+    await db.query(
+      'UPDATE products SET name=?, description=?, price=?, stock_quantity=?, category_id=?, image_url=? WHERE id=?',
+      [
+        String(name || '').trim(),
+        String(description || ''),
+        Number(price) || 0,
+        Number(stock_quantity) || 0,
+        Number(category_id),
+        image_url || null,
+        id,
+      ]
+    );
+    const [[product]] = await db.query('SELECT * FROM products WHERE id=?', [id]);
+    res.json(product);
+  } catch (err) {
+    console.error('PUT /api/admin/products error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// DELETE /api/admin/products/:id — видалити товар
+// ============================================
+app.delete('/api/admin/products/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    await db.query('DELETE FROM order_items WHERE product_id=?', [id]);
+    await db.query('DELETE FROM products WHERE id=?', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/admin/products error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
 // 6. Запуск сервера
 // ============================================
 app.listen(PORT, async () => {
   console.log(`🚀 Сервер запущено на http://localhost:${PORT}`);
   await testConnection();
+  await seedAdmin();
   console.log('');
   console.log('Доступні маршрути:');
   console.log(`  GET  http://localhost:${PORT}/`);
